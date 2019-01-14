@@ -18,8 +18,11 @@ from nyaa import create_app, models
 from nyaa.extensions import db
 
 app = create_app('config')
-es = Elasticsearch(timeout=30)
+es = Elasticsearch(hosts=app.config['ES_HOSTS'], timeout=30)
 ic = IndicesClient(es)
+
+def pad_bytes(in_bytes, size):
+    return in_bytes + (b'\x00' * max(0, size - len(in_bytes)))
 
 # turn into thing that elasticsearch indexes. We flatten in
 # the stats (seeders/leechers) so we can order by them in es naturally.
@@ -42,7 +45,7 @@ def mk_es(t, index_name):
             "created_time": t.created_time,
             # not analyzed but included so we can render magnet links
             # without querying sql again.
-            "info_hash": t.info_hash.hex(),
+            "info_hash": pad_bytes(t.info_hash, 20).hex(),
             "filesize": t.filesize,
             "uploader_id": t.uploader_id,
             "main_category_id": t.main_category_id,
@@ -98,34 +101,34 @@ FLAVORS = [
 with app.app_context():
     master_status = db.engine.execute('SHOW MASTER STATUS;').fetchone()
 
-position_json = {
-    'log_file': master_status[0], 
-    'log_pos': master_status[1]
-}
+    position_json = {
+        'log_file': master_status[0],
+        'log_pos': master_status[1]
+    }
 
-print('Save the following in the file configured in your ES sync config JSON:')
-print(json.dumps(position_json))
+    print('Save the following in the file configured in your ES sync config JSON:')
+    print(json.dumps(position_json))
 
-for flavor, torrent_class in FLAVORS:
-    print('Importing torrents for index', flavor, 'from', torrent_class)
-    bar = progressbar.ProgressBar(
-        maxval=torrent_class.query.count(),
-        widgets=[ progressbar.SimpleProgress(),
-                  ' [', progressbar.Timer(), '] ',
-                  progressbar.Bar(),
-                  ' (', progressbar.ETA(), ') ',
-            ])
+    for flavor, torrent_class in FLAVORS:
+        print('Importing torrents for index', flavor, 'from', torrent_class)
+        bar = progressbar.ProgressBar(
+            maxval=torrent_class.query.count(),
+            widgets=[ progressbar.SimpleProgress(),
+                      ' [', progressbar.Timer(), '] ',
+                      progressbar.Bar(),
+                      ' (', progressbar.ETA(), ') ',
+                ])
 
-    # turn off refreshes while bulk loading
-    ic.put_settings(body={'index': {'refresh_interval': '-1'}}, index=flavor)
+        # turn off refreshes while bulk loading
+        ic.put_settings(body={'index': {'refresh_interval': '-1'}}, index=flavor)
 
-    bar.start()
-    helpers.bulk(es, (mk_es(t, flavor) for t in page_query(torrent_class.query, progress_bar=bar)), chunk_size=10000)
-    bar.finish()
+        bar.start()
+        helpers.bulk(es, (mk_es(t, flavor) for t in page_query(torrent_class.query, progress_bar=bar)), chunk_size=10000)
+        bar.finish()
 
-    # Refresh the index immideately
-    ic.refresh(index=flavor)
-    print('Index refresh done.')
+        # Refresh the index immideately
+        ic.refresh(index=flavor)
+        print('Index refresh done.')
 
-    # restore to near-enough real time
-    ic.put_settings(body={'index': {'refresh_interval': '30s'}}, index=flavor)
+        # restore to near-enough real time
+        ic.put_settings(body={'index': {'refresh_interval': '30s'}}, index=flavor)

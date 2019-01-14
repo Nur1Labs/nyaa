@@ -55,11 +55,11 @@
 			</tr>
 		</thead>
 		<tbody>
+			{% set icon_dir = config.SITE_FLAVOR %}
 			{% set torrents = torrent_query if use_elastic else torrent_query.items %}
 			{% for torrent in torrents %}
 			<tr class="{% if torrent.deleted %}deleted{% elif torrent.hidden %}warning{% elif torrent.remake %}danger{% elif torrent.trusted %}success{% else %}default{% endif %}">
 				{% set cat_id = use_elastic and ((torrent.main_category_id|string) + '_' + (torrent.sub_category_id|string)) or torrent.sub_category.id_as_string %}
-				{% set icon_dir = config.SITE_FLAVOR %}
 				<td style="padding:0 4px;">
 				{% if use_elastic %}
 				<a href="{{ url_for('main.home', c=cat_id) }}" title="{{ category_name(cat_id) }}">
@@ -86,7 +86,7 @@
 				<td class="text-center" style="white-space: nowrap;">
 					{% if torrent.has_torrent %}<a href="{{ url_for('torrents.download', torrent_id=torrent_id) }}"><i class="fa fa-fw fa-download"></i></a>{% endif %}
 					{% if use_elastic %}
-					<a href="{{ create_magnet_from_es_info(torrent.display_name, torrent.info_hash) }}"><i class="fa fa-fw fa-magnet"></i></a>
+					<a href="{{ create_magnet_from_es_torrent(torrent) }}"><i class="fa fa-fw fa-magnet"></i></a>
 					{% else %}
 					<a href="{{ torrent.magnet_uri }}"><i class="fa fa-fw fa-magnet"></i></a>
 					{% endif %}

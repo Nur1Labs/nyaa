@@ -69,13 +69,123 @@ def _generate_query_string(term, category, filter, user):
     return params
 
 
+# For preprocessing ES search terms in _parse_es_search_terms
+QUOTED_LITERAL_REGEX = re.compile(r'(?i)(-)?"(.+?)"')
+QUOTED_LITERAL_GROUP_REGEX = re.compile(r'''
+    (?i)
+    (-)? # Negate entire group at once
+    (
+        ".+?" # First literal
+        (?:
+            \|    # OR
+            ".+?" # Second literal
+        )+        # repeating
+    )
+    ''', re.X)
+
+
+def _es_name_exact_phrase(literal):
+    ''' Returns a Query for a phrase match on the display_name for a given literal '''
+    return Q({
+        'match_phrase': {
+            'display_name.exact': {
+                'query': literal,
+                'analyzer': 'exact_analyzer'
+            }
+        }
+    })
+
+
+def _parse_es_search_terms(search, search_terms):
+    ''' Parse search terms into a query with properly handled literal phrases
+        (the simple_query_string is not so great with exact results).
+        For example:
+            foo bar "hello world" -"exclude this"
+        will become a must simple_query_string for "foo bar", a must phrase_match for
+        "hello world" and a must_not for "exclude this".
+        Returns the search with the generated bool-query added to it. '''
+
+    # Literal must and must-not sets
+    must_set = set()
+    must_not_set = set()
+
+    must_or_groups = []
+    must_not_or_groups = []
+
+    def must_group_matcher(match):
+        ''' Grabs [-]"foo"|"bar"[|"baz"...] groups from the search terms '''
+        negated = bool(match.group(1))
+        literal_group = match.group(2)
+
+        literals = QUOTED_LITERAL_REGEX.findall(literal_group)
+        group_query = Q(
+            'bool',
+            should=[_es_name_exact_phrase(lit_m[1]) for lit_m in literals]
+        )
+
+        if negated:
+            must_not_or_groups.append(group_query)
+        else:
+            must_or_groups.append(group_query)
+
+        # Remove the parsed group from search terms
+        return ''
+
+    def must_matcher(match):
+        ''' Grabs [-]"foo" literals from the search terms '''
+        negated = bool(match.group(1))
+        literal = match.group(2)
+
+        if negated:
+            must_not_set.add(literal)
+        else:
+            must_set.add(literal)
+
+        # Remove the parsed literal from search terms
+        return ''
+
+    # Remove quoted parts (optionally prepended with -) and store them in the sets
+    parsed_search_terms = QUOTED_LITERAL_GROUP_REGEX.sub(must_group_matcher, search_terms).strip()
+    parsed_search_terms = QUOTED_LITERAL_REGEX.sub(must_matcher, parsed_search_terms).strip()
+
+    # Create phrase matches (if any)
+    must_queries = [_es_name_exact_phrase(lit) for lit in must_set] + must_or_groups
+    must_not_queries = [_es_name_exact_phrase(lit) for lit in must_not_set] + must_not_or_groups
+
+    if parsed_search_terms:
+        # Normal text search without the quoted parts
+        must_queries.append(
+            Q(
+                'simple_query_string',
+                # Query both fields, latter for words with >15 chars
+                fields=['display_name', 'display_name.fullword'],
+                analyzer='my_search_analyzer',
+                default_operator="AND",
+                query=parsed_search_terms
+            )
+        )
+
+    if must_queries or must_not_queries:
+        # Create a combined Query with the positive and negative matches
+        combined_search_query = Q(
+            'bool',
+            must=must_queries,
+            must_not=must_not_queries
+        )
+        search = search.query(combined_search_query)
+
+    return search
+
+
 def search_elastic(term='', user=None, sort='id', order='desc',
                    category='0_0', quality_filter='0', page=1,
                    rss=False, admin=False, logged_in_user=None,
                    per_page=75, max_search_results=1000):
     # This function can easily be memcached now
+    if page > 4294967295:
+        flask.abort(404)
 
-    es_client = Elasticsearch()
+    es_client = Elasticsearch(hosts=app.config['ES_HOSTS'])
 
     es_sort_keys = {
         'id': 'id',
@@ -163,12 +273,8 @@ def search_elastic(term='', user=None, sort='id', order='desc',
 
     # Apply search term
     if term:
-        s = s.query('simple_query_string',
-                    # Query both fields, latter for words with >15 chars
-                    fields=['display_name', 'display_name.fullword'],
-                    analyzer='my_search_analyzer',
-                    default_operator="AND",
-                    query=term)
+        # Do some preprocessing on the search terms for literal "" matching
+        s = _parse_es_search_terms(s, term)
 
     # User view (/user/username)
     if user:
@@ -263,6 +369,9 @@ class QueryPairCaller(object):
 def search_db(term='', user=None, sort='id', order='desc', category='0_0',
               quality_filter='0', page=1, rss=False, admin=False,
               logged_in_user=None, per_page=75):
+    if page > 4294967295:
+        flask.abort(404)
+
     sort_keys = {
         'id': models.Torrent.id,
         'size': models.Torrent.filesize,

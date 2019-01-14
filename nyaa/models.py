@@ -1,4 +1,5 @@
 import base64
+import os.path
 import re
 from datetime import datetime
 from enum import Enum, IntEnum
@@ -15,7 +16,7 @@ from sqlalchemy.ext import declarative
 from sqlalchemy_fulltext import FullText
 from sqlalchemy_utils import ChoiceType, EmailType, PasswordType
 
-from nyaa.extensions import config, db
+from nyaa.extensions import cache, config, db
 from nyaa.torrents import create_magnet
 
 app = flask.current_app
@@ -99,6 +100,7 @@ class TorrentFlags(IntEnum):
     COMPLETE = 16
     DELETED = 32
     BANNED = 64
+    COMMENT_LOCKED = 128
 
 
 class TorrentBase(DeclarativeHelperBase):
@@ -171,11 +173,6 @@ class TorrentBase(DeclarativeHelperBase):
                                primaryjoin=join_sql.format(cls.__flavor__))
 
     @declarative.declared_attr
-    def info(cls):
-        return db.relationship(cls._flavor_prefix('TorrentInfo'), uselist=False,
-                               cascade="all, delete-orphan", back_populates='torrent')
-
-    @declarative.declared_attr
     def filelist(cls):
         return db.relationship(cls._flavor_prefix('TorrentFilelist'), uselist=False,
                                cascade="all, delete-orphan", back_populates='torrent')
@@ -225,9 +222,17 @@ class TorrentBase(DeclarativeHelperBase):
             invalid_url_characters = '<>"'
             # Check if url contains invalid characters
             if not any(c in url for c in invalid_url_characters):
-                return '<a href="{0}">{1}</a>'.format(url, escape_markup(unquote_url(url)))
+                return('<a rel="noopener noreferrer nofollow" '
+                       'href="{0}">{1}</a>'.format(url, escape_markup(unquote_url(url))))
         # Escaped
         return escape_markup(self.information)
+
+    @property
+    def info_dict_path(self):
+        ''' Returns a path to the info_dict file in form of 'info_dicts/aa/bb/aabbccddee...' '''
+        info_hash = self.info_hash_as_hex
+        return os.path.join(app.config['BASE_DIR'], 'info_dicts',
+                            info_hash[0:2], info_hash[2:4], info_hash)
 
     @property
     def info_hash_as_b32(self):
@@ -238,6 +243,7 @@ class TorrentBase(DeclarativeHelperBase):
         return self.info_hash.hex()
 
     @property
+    @cache.memoize(timeout=3600)
     def magnet_uri(self):
         return create_magnet(self)
 
@@ -255,6 +261,7 @@ class TorrentBase(DeclarativeHelperBase):
     trusted = FlagProperty(TorrentFlags.TRUSTED)
     remake = FlagProperty(TorrentFlags.REMAKE)
     complete = FlagProperty(TorrentFlags.COMPLETE)
+    comment_locked = FlagProperty(TorrentFlags.COMMENT_LOCKED)
 
     # Class methods
 
@@ -288,22 +295,6 @@ class TorrentFilelistBase(DeclarativeHelperBase):
     def torrent(cls):
         return db.relationship(cls._flavor_prefix('Torrent'), uselist=False,
                                back_populates='filelist')
-
-
-class TorrentInfoBase(DeclarativeHelperBase):
-    __tablename_base__ = 'torrents_info'
-
-    __table_args__ = {'mysql_row_format': 'COMPRESSED'}
-
-    @declarative.declared_attr
-    def torrent_id(cls):
-        return db.Column(db.Integer, db.ForeignKey(
-            cls._table_prefix('torrents.id'), ondelete="CASCADE"), primary_key=True)
-    info_dict = db.Column(MediumBlobType, nullable=True)
-
-    @declarative.declared_attr
-    def torrent(cls):
-        return db.relationship(cls._flavor_prefix('Torrent'), uselist=False, back_populates='info')
 
 
 class StatisticBase(DeclarativeHelperBase):
@@ -433,12 +424,18 @@ class CommentBase(DeclarativeHelperBase):
         return db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'))
 
     created_time = db.Column(db.DateTime(timezone=False), default=datetime.utcnow)
+    edited_time = db.Column(db.DateTime(timezone=False), onupdate=datetime.utcnow)
     text = db.Column(TextType(collation=COL_UTF8MB4_BIN), nullable=False)
 
     @declarative.declared_attr
     def user(cls):
         return db.relationship('User', uselist=False,
                                back_populates=cls._table_prefix('comments'), lazy="joined")
+
+    @declarative.declared_attr
+    def torrent(cls):
+        return db.relationship(cls._flavor_prefix('Torrent'), uselist=False,
+                               back_populates='comments', lazy="joined")
 
     def __repr__(self):
         return '<Comment %r>' % self.id
@@ -447,6 +444,20 @@ class CommentBase(DeclarativeHelperBase):
     def created_utc_timestamp(self):
         ''' Returns a UTC POSIX timestamp, as seconds '''
         return (self.created_time - UTC_EPOCH).total_seconds()
+
+    @property
+    def edited_utc_timestamp(self):
+        ''' Returns a UTC POSIX timestamp, as seconds '''
+        return (self.edited_time - UTC_EPOCH).total_seconds() if self.edited_time else 0
+
+    @property
+    def editable_until(self):
+        return self.created_utc_timestamp + config['EDITING_TIME_LIMIT']
+
+    @property
+    def editing_limit_exceeded(self):
+        limit = config['EDITING_TIME_LIMIT']
+        return bool(limit and (datetime.utcnow() - self.created_time).total_seconds() >= limit)
 
 
 class UserLevelType(IntEnum):
@@ -477,6 +488,7 @@ class User(db.Model):
     created_time = db.Column(db.DateTime(timezone=False), default=datetime.utcnow)
     last_login_date = db.Column(db.DateTime(timezone=False), default=None, nullable=True)
     last_login_ip = db.Column(db.Binary(length=16), default=None, nullable=True)
+    registration_ip = db.Column(db.Binary(length=16), default=None, nullable=True)
 
     nyaa_torrents = db.relationship('NyaaTorrent', back_populates='user', lazy='dynamic')
     nyaa_comments = db.relationship('NyaaComment', back_populates='user', lazy='dynamic')
@@ -485,6 +497,9 @@ class User(db.Model):
     sukebei_comments = db.relationship('SukebeiComment', back_populates='user', lazy='dynamic')
 
     bans = db.relationship('Ban', uselist=True, foreign_keys='Ban.user_id')
+
+    preferences = db.relationship('UserPreferences',
+                                  back_populates='user', uselist=False, lazy='joined')
 
     def __init__(self, username, email, password):
         self.username = username
@@ -507,19 +522,27 @@ class User(db.Model):
         return all(checks)
 
     def gravatar_url(self):
-        # from http://en.gravatar.com/site/implement/images/python/
-        params = {
-            # Image size (https://en.gravatar.com/site/implement/images/#size)
-            's': 120,
-            # Default image (https://en.gravatar.com/site/implement/images/#default-image)
-            'd': flask.url_for('static', filename='img/avatar/default.png', _external=True),
-            # Image rating (https://en.gravatar.com/site/implement/images/#rating)
-            # Nyaa: PG-rated, Sukebei: X-rated
-            'r': 'pg' if app.config['SITE_FLAVOR'] == 'nyaa' else 'x',
-        }
-        # construct the url
-        return 'https://www.gravatar.com/avatar/{}?{}'.format(
-            md5(self.email.encode('utf-8').lower()).hexdigest(), urlencode(params))
+        if 'DEFAULT_GRAVATAR_URL' in app.config:
+            default_url = app.config['DEFAULT_GRAVATAR_URL']
+        else:
+            default_url = flask.url_for('static', filename='img/avatar/default.png',
+                                        _external=True)
+        if app.config['ENABLE_GRAVATAR']:
+            # from http://en.gravatar.com/site/implement/images/python/
+            params = {
+                # Image size (https://en.gravatar.com/site/implement/images/#size)
+                's': 120,
+                # Default image (https://en.gravatar.com/site/implement/images/#default-image)
+                'd': default_url,
+                # Image rating (https://en.gravatar.com/site/implement/images/#rating)
+                # Nyaa: PG-rated, Sukebei: X-rated
+                'r': 'pg' if app.config['SITE_FLAVOR'] == 'nyaa' else 'x',
+            }
+            # construct the url
+            return 'https://www.gravatar.com/avatar/{}?{}'.format(
+                md5(self.email.encode('utf-8').lower()).hexdigest(), urlencode(params))
+        else:
+            return default_url
 
     @property
     def userlevel_str(self):
@@ -563,12 +586,21 @@ class User(db.Model):
         if self.last_login_ip:
             return str(ip_address(self.last_login_ip))
 
+    @property
+    def reg_ip_string(self):
+        if self.registration_ip:
+            return str(ip_address(self.registration_ip))
+
     @classmethod
     def by_id(cls, id):
         return cls.query.get(id)
 
     @classmethod
     def by_username(cls, username):
+        def isascii(s): return len(s) == len(s.encode())
+        if not isascii(username):
+            return None
+
         user = cls.query.filter_by(username=username).first()
         return user
 
@@ -596,6 +628,35 @@ class User(db.Model):
     @property
     def is_banned(self):
         return self.status == UserStatusType.BANNED
+
+    @property
+    def is_active(self):
+        return self.status != UserStatusType.INACTIVE
+
+    @property
+    def age(self):
+        '''Account age in seconds'''
+        return (datetime.utcnow() - self.created_time).total_seconds()
+
+    @property
+    def created_utc_timestamp(self):
+        ''' Returns a UTC POSIX timestamp, as seconds '''
+        return (self.created_time - UTC_EPOCH).total_seconds()
+
+
+class UserPreferences(db.Model):
+    __tablename__ = 'user_preferences'
+
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+
+    def __init__(self, user_id):
+        self.user_id = user_id
+
+    def __repr__(self):
+        return '<UserPreferences %r>' % self.user_id
+
+    user = db.relationship('User', back_populates='preferences')
+    hide_comments = db.Column(db.Boolean, nullable=False, default=False)
 
 
 class AdminLogBase(DeclarativeHelperBase):
@@ -734,6 +795,57 @@ class Ban(db.Model):
         return None
 
 
+class TrackerApiBase(DeclarativeHelperBase):
+    __tablename_base__ = 'trackerapi'
+
+    id = db.Column(db.Integer, primary_key=True)
+    info_hash = db.Column(BinaryType(length=20), nullable=False)
+    method = db.Column(db.String(length=255), nullable=False)
+    # Methods = insert, remove
+
+    def __init__(self, info_hash, method):
+        self.info_hash = info_hash
+        self.method = method
+
+
+class RangeBan(db.Model):
+    __tablename__ = 'rangebans'
+
+    id = db.Column(db.Integer, primary_key=True)
+    _cidr_string = db.Column('cidr_string', db.String(length=18), nullable=False)
+    masked_cidr = db.Column(db.BigInteger, nullable=False,
+                            index=True)
+    mask = db.Column(db.BigInteger, nullable=False, index=True)
+    enabled = db.Column(db.Boolean, nullable=False, default=True)
+    # If this rangeban may be automatically cleared once it becomes
+    # out of date, set this column to the creation time of the ban.
+    # None (or NULL in the db) is understood as the ban being permanent.
+    temp = db.Column(db.DateTime(timezone=False), nullable=True, default=None)
+
+    @property
+    def cidr_string(self):
+        return self._cidr_string
+
+    @cidr_string.setter
+    def cidr_string(self, s):
+        subnet, masked_bits = s.split('/')
+        subnet_b = ip_address(subnet).packed
+        self.mask = (1 << 32) - (1 << (32 - int(masked_bits)))
+        self.masked_cidr = int.from_bytes(subnet_b, 'big') & self.mask
+        self._cidr_string = s
+
+    @classmethod
+    def is_rangebanned(cls, ip):
+        if len(ip) > 4:
+            raise NotImplementedError("IPv6 is unsupported.")
+        elif len(ip) < 4:
+            raise ValueError("Not an IP address.")
+        ip_int = int.from_bytes(ip, 'big')
+        q = cls.query.filter(cls.mask.op('&')(ip_int) == cls.masked_cidr,
+                             cls.enabled)
+        return q.count() > 0
+
+
 # Actually declare our site-specific classes
 
 # Torrent
@@ -769,15 +881,6 @@ class NyaaTorrentFilelist(TorrentFilelistBase, db.Model):
 
 
 class SukebeiTorrentFilelist(TorrentFilelistBase, db.Model):
-    __flavor__ = 'Sukebei'
-
-
-# TorrentInfo
-class NyaaTorrentInfo(TorrentInfoBase, db.Model):
-    __flavor__ = 'Nyaa'
-
-
-class SukebeiTorrentInfo(TorrentInfoBase, db.Model):
     __flavor__ = 'Sukebei'
 
 
@@ -844,11 +947,19 @@ class SukebeiReport(ReportBase, db.Model):
     __flavor__ = 'Sukebei'
 
 
+# TrackerApi
+class NyaaTrackerApi(TrackerApiBase, db.Model):
+    __flavor__ = 'Nyaa'
+
+
+class SukebeiTrackerApi(TrackerApiBase, db.Model):
+    __flavor__ = 'Sukebei'
+
+
 # Choose our defaults for models.Torrent etc
 if config['SITE_FLAVOR'] == 'nyaa':
     Torrent = NyaaTorrent
     TorrentFilelist = NyaaTorrentFilelist
-    TorrentInfo = NyaaTorrentInfo
     Statistic = NyaaStatistic
     TorrentTrackers = NyaaTorrentTrackers
     MainCategory = NyaaMainCategory
@@ -857,11 +968,11 @@ if config['SITE_FLAVOR'] == 'nyaa':
     AdminLog = NyaaAdminLog
     Report = NyaaReport
     TorrentNameSearch = NyaaTorrentNameSearch
+    TrackerApi = NyaaTrackerApi
 
 elif config['SITE_FLAVOR'] == 'sukebei':
     Torrent = SukebeiTorrent
     TorrentFilelist = SukebeiTorrentFilelist
-    TorrentInfo = SukebeiTorrentInfo
     Statistic = SukebeiStatistic
     TorrentTrackers = SukebeiTorrentTrackers
     MainCategory = SukebeiMainCategory
@@ -870,3 +981,4 @@ elif config['SITE_FLAVOR'] == 'sukebei':
     AdminLog = SukebeiAdminLog
     Report = SukebeiReport
     TorrentNameSearch = SukebeiTorrentNameSearch
+    TrackerApi = SukebeiTrackerApi

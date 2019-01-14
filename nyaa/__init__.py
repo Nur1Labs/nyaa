@@ -6,7 +6,7 @@ import flask
 from flask_assets import Bundle  # noqa F401
 
 from nyaa.api_handler import api_blueprint
-from nyaa.extensions import assets, db, fix_paginate, toolbar
+from nyaa.extensions import assets, cache, db, fix_paginate, toolbar
 from nyaa.template_utils import bp as template_utils_bp
 from nyaa.utils import random_string
 from nyaa.views import register_views
@@ -81,6 +81,12 @@ def create_app(config):
 
     # Assets
     assets.init_app(app)
+    assets._named_bundles = {}  # Hack to fix state carrying over in tests
+    main_js = Bundle('js/main.js', filters='rjsmin', output='js/main.min.js')
+    bs_js = Bundle('js/bootstrap-select.js', filters='rjsmin',
+                   output='js/bootstrap-select.min.js')
+    assets.register('main_js', main_js)
+    assets.register('bs_js', bs_js)
     # css = Bundle('style.scss', filters='libsass',
     #             output='style.css', depends='**/*.scss')
     # assets.register('style_all', css)
@@ -89,5 +95,14 @@ def create_app(config):
     app.register_blueprint(template_utils_bp)
     app.register_blueprint(api_blueprint)
     register_views(app)
+
+    # Pregenerate some URLs to avoid repeat url_for calls
+    if 'SERVER_NAME' in app.config and app.config['SERVER_NAME']:
+        with app.app_context():
+            url = flask.url_for('static', filename='img/avatar/default.png', _external=True)
+            app.config['DEFAULT_GRAVATAR_URL'] = url
+
+    # Cache
+    cache.init_app(app)
 
     return app

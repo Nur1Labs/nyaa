@@ -1,5 +1,8 @@
+import binascii
 import math
+import time
 from ipaddress import ip_address
+from itertools import chain
 
 import flask
 from flask_paginate import Pagination
@@ -10,7 +13,7 @@ from nyaa import forms, models
 from nyaa.extensions import db
 from nyaa.search import (DEFAULT_MAX_SEARCH_RESULT, DEFAULT_PER_PAGE, SERACH_PAGINATE_DISPLAY_MSG,
                          _generate_query_string, search_db, search_elastic)
-from nyaa.utils import chain_get
+from nyaa.utils import admin_only, chain_get, sha1_hash
 
 app = flask.current_app
 bp = flask.Blueprint('users', __name__)
@@ -27,6 +30,7 @@ def view_user(user_name):
     ban_form = None
     bans = None
     ipbanned = None
+    nuke_form = None
     if flask.g.user and flask.g.user.is_moderator and flask.g.user.level > user.level:
         admin_form = forms.UserForm()
         default, admin_form.user_class.choices = _create_user_class_choices(user)
@@ -34,6 +38,7 @@ def view_user(user_name):
             admin_form.user_class.data = default
 
         ban_form = forms.BanForm()
+        nuke_form = forms.NukeForm()
         if flask.request.method == 'POST':
             doban = (ban_form.ban_user.data or ban_form.unban.data or ban_form.ban_userip.data)
         bans = models.Ban.banned(user.id, user.last_login_ip).all()
@@ -42,20 +47,25 @@ def view_user(user_name):
     url = flask.url_for('users.view_user', user_name=user.username)
     if flask.request.method == 'POST' and admin_form and not doban and admin_form.validate():
         selection = admin_form.user_class.data
-        log = None
-        if selection == 'regular':
-            user.level = models.UserLevelType.REGULAR
-            log = "[{}]({}) changed to regular user".format(user_name, url)
-        elif selection == 'trusted':
-            user.level = models.UserLevelType.TRUSTED
-            log = "[{}]({}) changed to trusted user".format(user_name, url)
-        elif selection == 'moderator':
-            user.level = models.UserLevelType.MODERATOR
-            log = "[{}]({}) changed to moderator user".format(user_name, url)
+        mapping = {'regular': models.UserLevelType.REGULAR,
+                   'trusted': models.UserLevelType.TRUSTED,
+                   'moderator': models.UserLevelType.MODERATOR}
 
-        adminlog = models.AdminLog(log=log, admin_id=flask.g.user.id)
+        if mapping[selection] != user.level:
+            user.level = mapping[selection]
+            log = "[{}]({}) changed to {} user".format(user_name, url, selection)
+            adminlog = models.AdminLog(log=log, admin_id=flask.g.user.id)
+            db.session.add(adminlog)
+
+        if admin_form.activate_user.data and not user.is_banned:
+            if user.status != models.UserStatusType.ACTIVE:
+                user.status = models.UserStatusType.ACTIVE
+                adminlog = models.AdminLog("[{}]({}) was manually activated"
+                                           .format(user_name, url), admin_id=flask.g.user.id)
+                db.session.add(adminlog)
+                flask.flash('{} was manually activated'.format(user_name), 'success')
+
         db.session.add(user)
-        db.session.add(adminlog)
         db.session.commit()
 
         return flask.redirect(url)
@@ -166,6 +176,7 @@ def view_user(user_name):
                                      rss_filter=rss_query_string,
                                      admin_form=admin_form,
                                      ban_form=ban_form,
+                                     nuke_form=nuke_form,
                                      bans=bans,
                                      ipbanned=ipbanned)
     # Similar logic as home page
@@ -184,8 +195,36 @@ def view_user(user_name):
                                      rss_filter=rss_query_string,
                                      admin_form=admin_form,
                                      ban_form=ban_form,
+                                     nuke_form=nuke_form,
                                      bans=bans,
                                      ipbanned=ipbanned)
+
+
+@bp.route('/user/<user_name>/comments')
+def view_user_comments(user_name):
+    user = models.User.by_username(user_name)
+
+    if not user:
+        flask.abort(404)
+
+    # Only moderators get to see all comments for now
+    if not flask.g.user or not flask.g.user.is_moderator:
+        flask.abort(403)
+
+    page_number = flask.request.args.get('p')
+    try:
+        page_number = max(1, int(page_number))
+    except (ValueError, TypeError):
+        page_number = 1
+
+    comments_per_page = 100
+
+    comments_query = (models.Comment.query.filter(models.Comment.user == user)
+                                          .order_by(models.Comment.created_time.desc()))
+    comments_query = comments_query.paginate_faste(page_number, per_page=comments_per_page, step=5)
+    return flask.render_template('user_comments.html',
+                                 comments_query=comments_query,
+                                 user=user)
 
 
 @bp.route('/user/activate/<payload>')
@@ -202,15 +241,64 @@ def activate_user(payload):
 
     user = models.User.by_id(user_id)
 
-    if not user:
+    # Only allow activating inactive users
+    if not user or user.status != models.UserStatusType.INACTIVE:
         flask.abort(404)
 
+    # Set user active
     user.status = models.UserStatusType.ACTIVE
-
     db.session.add(user)
     db.session.commit()
 
-    return flask.redirect(flask.url_for('account.login'))
+    # Log user in
+    flask.g.user = user
+    flask.session['user_id'] = user.id
+    flask.session.permanent = True
+    flask.session.modified = True
+
+    flask.flash(flask.Markup("You've successfully verified your account!"), 'success')
+    return flask.redirect(flask.url_for('main.home'))
+
+
+@bp.route('/user/<user_name>/nuke/torrents', methods=['POST'])
+@admin_only
+def nuke_user_torrents(user_name):
+    user = models.User.by_username(user_name)
+    if not user:
+        flask.abort(404)
+
+    nuke_form = forms.NukeForm(flask.request.form)
+    if not nuke_form.validate():
+        flask.abort(401)
+    url = flask.url_for('users.view_user', user_name=user.username)
+    nyaa_banned = 0
+    sukebei_banned = 0
+    for t in chain(user.nyaa_torrents, user.sukebei_torrents):
+        t.deleted = True
+        t.banned = True
+        t.stats.seed_count = 0
+        t.stats.leech_count = 0
+        db.session.add(t)
+        if isinstance(t, models.NyaaTorrent):
+            db.session.add(models.NyaaTrackerApi(t.info_hash, 'remove'))
+            nyaa_banned += 1
+        else:
+            db.session.add(models.SukebeiTrackerApi(t.info_hash, 'remove'))
+            sukebei_banned += 1
+
+    for log_flavour, num in ((models.NyaaAdminLog, nyaa_banned),
+                             (models.SukebeiAdminLog, sukebei_banned)):
+        if num > 0:
+            log = "Nuked {0} torrents of [{1}]({2})".format(num,
+                                                            user.username,
+                                                            url)
+            adminlog = log_flavour(log=log, admin_id=flask.g.user.id)
+            db.session.add(adminlog)
+
+    db.session.commit()
+    flask.flash('Torrents of {0} have been nuked.'.format(user.username),
+                'success')
+    return flask.redirect(url)
 
 
 def _create_user_class_choices(user):
@@ -243,3 +331,13 @@ def get_activation_link(user):
     s = get_serializer()
     payload = s.dumps(user.id)
     return flask.url_for('users.activate_user', payload=payload, _external=True)
+
+
+def get_password_reset_link(user):
+    # This mess to not to have static password reset links
+    # Maybe not the best idea? But this should not be a security risk, and it works.
+    password_hash_hash = binascii.hexlify(sha1_hash(user.password_hash.hash)).decode()
+
+    s = get_serializer()
+    payload = s.dumps((time.time(), password_hash_hash, user.id))
+    return flask.url_for('account.password_reset', payload=payload, _external=True)

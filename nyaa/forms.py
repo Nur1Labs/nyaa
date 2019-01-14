@@ -14,6 +14,9 @@ from wtforms.validators import (DataRequired, Email, EqualTo, Length, Optional, 
 from wtforms.widgets import Select as SelectWidget  # For DisabledSelectField
 from wtforms.widgets import HTMLString, html_params  # For DisabledSelectField
 
+import dns.exception
+import dns.resolver
+
 from nyaa import bencode, models, utils
 from nyaa.extensions import config
 from nyaa.models import User
@@ -50,6 +53,78 @@ def stop_on_validation_error(f):
     return decorator
 
 
+def recaptcha_validator_shim(form, field):
+    if app.config['USE_RECAPTCHA']:
+        return RecaptchaValidator()(form, field)
+    else:
+        # Always pass validating the recaptcha field if disabled
+        return True
+
+
+def upload_recaptcha_validator_shim(form, field):
+    ''' Selectively does a recaptcha validation '''
+    if app.config['USE_RECAPTCHA']:
+        # Recaptcha anonymous and new users
+        if not flask.g.user or flask.g.user.age < app.config['ACCOUNT_RECAPTCHA_AGE']:
+            return RecaptchaValidator()(form, field)
+    else:
+        # Always pass validating the recaptcha field if disabled
+        return True
+
+
+def register_email_blacklist_validator(form, field):
+    email_blacklist = app.config.get('EMAIL_BLACKLIST', [])
+    email = field.data.strip()
+    validation_exception = StopValidation('Blacklisted email provider')
+
+    for item in email_blacklist:
+        if isinstance(item, re._pattern_type):
+            if item.search(email):
+                raise validation_exception
+        elif isinstance(item, str):
+            if item in email.lower():
+                raise validation_exception
+        else:
+            raise Exception('Unexpected email validator type {!r} ({!r})'.format(type(item), item))
+    return True
+
+
+def register_email_server_validator(form, field):
+    server_blacklist = app.config.get('EMAIL_SERVER_BLACKLIST', [])
+    if not server_blacklist:
+        return True
+
+    validation_exception = StopValidation('Blacklisted email provider')
+    email = field.data.strip()
+    email_domain = email.split('@', 1)[-1]
+
+    try:
+        # Query domain MX records
+        mx_records = list(dns.resolver.query(email_domain, 'MX'))
+
+    except dns.exception.DNSException:
+        app.logger.error('Unable to query MX records for email: %s - ignoring',
+                         email, exc_info=False)
+        return True
+
+    for mx_record in mx_records:
+        try:
+            # Query mailserver A records
+            a_records = list(dns.resolver.query(mx_record.exchange))
+            for a_record in a_records:
+                # Check for address in blacklist
+                if a_record.address in server_blacklist:
+                    app.logger.warning('Rejected email %s due to blacklisted mailserver (%s, %s)',
+                                       email, a_record.address, mx_record.exchange)
+                    raise validation_exception
+
+        except dns.exception.DNSException:
+            app.logger.warning('Failed to query A records for mailserver: %s (%s) - ignoring',
+                               mx_record.exchange, email, exc_info=False)
+
+    return True
+
+
 _username_validator = Regexp(
     r'^[a-zA-Z0-9_\-]+$',
     message='Your username must only consist of alphanumerics and _- (a-zA-Z0-9_-)')
@@ -60,19 +135,42 @@ class LoginForm(FlaskForm):
     password = PasswordField('Password', [DataRequired()])
 
 
+class PasswordResetRequestForm(FlaskForm):
+    email = StringField('Email address', [
+        Email(),
+        DataRequired(),
+        Length(min=5, max=128)
+    ])
+
+    recaptcha = RecaptchaField(validators=[recaptcha_validator_shim])
+
+
+class PasswordResetForm(FlaskForm):
+    password = PasswordField('Password', [
+        DataRequired(),
+        EqualTo('password_confirm', message='Passwords must match'),
+        Length(min=6, max=1024,
+               message='Password must be at least %(min)d characters long.')
+    ])
+
+    password_confirm = PasswordField('Password (confirm)')
+
+
 class RegisterForm(FlaskForm):
     username = StringField('Username', [
         DataRequired(),
         Length(min=3, max=32),
         stop_on_validation_error(_username_validator),
-        Unique(User, User.username, 'Username not availiable')
+        Unique(User, User.username, 'Username not available')
     ])
 
     email = StringField('Email address', [
         Email(),
         DataRequired(),
         Length(min=5, max=128),
-        Unique(User, User.email, 'Email already in use by another account')
+        register_email_blacklist_validator,
+        Unique(User, User.email, 'Email already in use by another account'),
+        register_email_server_validator
     ])
 
     password = PasswordField('Password', [
@@ -106,6 +204,10 @@ class ProfileForm(FlaskForm):
     ])
 
     password_confirm = PasswordField('Repeat New Password')
+    hide_comments = BooleanField('Hide comments by default')
+
+    authorized_submit = SubmitField('Update')
+    submit_settings = SubmitField('Update')
 
 
 # Classes for a SelectField that can be set to disable options (id, name, disabled)
@@ -142,10 +244,12 @@ class DisabledSelectField(SelectField):
 
 class CommentForm(FlaskForm):
     comment = TextAreaField('Make a comment', [
-        Length(min=3, max=1024, message='Comment must be at least %(min)d characters '
+        Length(min=3, max=2048, message='Comment must be at least %(min)d characters '
                'long and %(max)d at most.'),
-        DataRequired()
+        DataRequired(message='Comment must not be empty.')
     ])
+
+    recaptcha = RecaptchaField(validators=[upload_recaptcha_validator_shim])
 
 
 class InlineButtonWidget(object):
@@ -199,11 +303,11 @@ class EditForm(FlaskForm):
         field.parsed_data = cat
 
     is_hidden = BooleanField('Hidden')
-    is_deleted = BooleanField('Deleted')
     is_remake = BooleanField('Remake')
     is_anonymous = BooleanField('Anonymous')
     is_complete = BooleanField('Complete')
     is_trusted = BooleanField('Trusted')
+    is_comment_locked = BooleanField('Lock Comments')
 
     information = StringField('Information', [
         Length(max=255, message='Information must be at most %(max)d characters long.')
@@ -239,6 +343,10 @@ class BanForm(FlaskForm):
     ])
 
 
+class NukeForm(FlaskForm):
+    nuke_torrents = SubmitField("\U0001F4A3 Nuke Torrents")
+
+
 class UploadForm(FlaskForm):
     torrent_file = FileField('Torrent file', [
         FileRequired()
@@ -251,17 +359,8 @@ class UploadForm(FlaskForm):
                        '%(max)d at most.')
     ])
 
-    if config['USE_RECAPTCHA']:
-        # Captcha only for not logged in users
-        _recaptcha_validator = RecaptchaValidator()
+    recaptcha = RecaptchaField(validators=[upload_recaptcha_validator_shim])
 
-        def _validate_recaptcha(form, field):
-            if not flask.g.user:
-                return UploadForm._recaptcha_validator(form, field)
-
-        recaptcha = RecaptchaField(validators=[_validate_recaptcha])
-
-    # category = SelectField('Category')
     category = DisabledSelectField('Category')
 
     def validate_category(form, field):
@@ -284,6 +383,7 @@ class UploadForm(FlaskForm):
     is_anonymous = BooleanField('Anonymous')
     is_complete = BooleanField('Complete')
     is_trusted = BooleanField('Trusted')
+    is_comment_locked = BooleanField('Lock Comments')
 
     information = StringField('Information', [
         Length(max=255, message='Information must be at most %(max)d characters long.')
@@ -291,6 +391,9 @@ class UploadForm(FlaskForm):
     description = TextAreaField('Description', [
         Length(max=10 * 1024, message='Description must be at most %(max)d characters long.')
     ])
+
+    ratelimit = HiddenField()
+    rangebanned = HiddenField()
 
     def validate_torrent_file(form, field):
         # Decode and ensure data is bencoded data
@@ -350,6 +453,7 @@ class UploadForm(FlaskForm):
 
 class UserForm(FlaskForm):
     user_class = SelectField('Change User Class')
+    activate_user = SubmitField('Activate User')
 
     def validate_user_class(form, field):
         if not field.data:
@@ -383,6 +487,7 @@ class ReportActionForm(FlaskForm):
 
 def _validate_trackers(torrent_dict, tracker_to_check_for=None):
     announce = torrent_dict.get('announce')
+    assert announce is not None, 'no tracker in torrent'
     announce_string = _validate_bytes(announce, 'announce', test_decode='utf-8')
 
     tracker_found = tracker_to_check_for and (
